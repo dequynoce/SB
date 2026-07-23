@@ -1,0 +1,167 @@
+name: Run RELIC or LLM-AHD baseline
+
+run-name: ${{ inputs.framework }} / ${{ inputs.problem }} / run ${{ github.run_number }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      framework:
+        description: Framework to train
+        required: true
+        default: RELIC
+        type: choice
+        options:
+          - RELIC
+          - EoH
+          - ReEvo
+          - MCTS-AHD
+          - HiFo
+          - MOTIF
+      problem:
+        description: Problem to train and evaluate
+        required: true
+        default: mapp_pc
+        type: choice
+        options:
+          - mapp_pc
+          - mapp_ar
+          - mapp_ds
+          - mas_fs
+          - mas_jd
+          - mas_st
+          - mapp_pc_v2
+          - mapp_ar_v2
+          - mapp_ds_v2
+          - mas_fs_v2
+          - mas_jd_v2
+          - mas_st_v2
+          - co_hmtsp
+          - co_fstsp
+          - co_fjagv
+          - co_mrcps
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ahd-${{ inputs.framework }}-${{ inputs.problem }}
+  cancel-in-progress: false
+
+jobs:
+  train-and-evaluate:
+    name: ${{ inputs.framework }} on ${{ inputs.problem }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+    steps:
+      - name: Check out RELIC repository
+        uses: actions/checkout@v5
+        with:
+          repository: Pham2004/RELIC
+          token: ${{ secrets.RELIC_PAT }}
+          path: relic
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+          cache: pip
+          cache-dependency-path: relic/requirements.txt
+
+      - name: Install dependencies
+        working-directory: relic
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run offline test suite
+        working-directory: relic
+        run: python -m unittest discover -v
+
+      - name: Verify OpenAI secret
+        shell: bash
+        run: |
+          if [[ -z "${OPENAI_API_KEY}" ]]; then
+            echo "::error::Repository secret OPENAI_API_KEY is not configured."
+            echo "Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Train and evaluate selected framework
+        id: experiment
+        shell: bash
+        working-directory: relic
+        run: |
+          set -euo pipefail
+
+          FRAMEWORK="${{ inputs.framework }}"
+          PROBLEM="${{ inputs.problem }}"
+          RUN_ID="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          case "${FRAMEWORK}" in
+            RELIC)    METHOD_ID="relic" ;;
+            EoH)      METHOD_ID="eoh" ;;
+            ReEvo)    METHOD_ID="reevo" ;;
+            MCTS-AHD) METHOD_ID="mcts_ahd" ;;
+            HiFo)     METHOD_ID="hifo" ;;
+            MOTIF)    METHOD_ID="motif" ;;
+            *)
+              echo "::error::Unsupported framework: ${FRAMEWORK}"
+              exit 2
+              ;;
+          esac
+
+          RESULT_ROOT="$(pwd)/github_results"
+          RESULT_PATH="${RESULT_ROOT}/${METHOD_ID}/results/${PROBLEM}/${RUN_ID}"
+          ARTIFACT_NAME="results-${METHOD_ID}-${PROBLEM}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "result_path=${RESULT_PATH}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+
+          echo "Framework : ${FRAMEWORK}"
+          echo "Problem   : ${PROBLEM}"
+          echo "Run ID    : ${RUN_ID}"
+          echo "Results   : ${RESULT_PATH}"
+
+          if [[ "${METHOD_ID}" == "relic" ]]; then
+            python main.py \
+              problem="${PROBLEM}" \
+              framework=relic \
+              path.RESULTS="${RESULT_PATH}"
+
+            python scripts/evaluate_relic_results.py \
+              --problem "${PROBLEM}" \
+              --results-dir "${RESULT_PATH}"
+          else
+            python -m baselines.llm_ahd.hydra_run \
+              method="${METHOD_ID}" \
+              problem="${PROBLEM}" \
+              trainer.seed=0 \
+              output.root="${RESULT_ROOT}" \
+              output.run_id="${RUN_ID}"
+          fi
+
+      - name: Upload result folder
+        if: always() && steps.experiment.outputs.result_path != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.experiment.outputs.artifact_name }}
+          path: ${{ steps.experiment.outputs.result_path }}
+          if-no-files-found: warn
+          retention-days: 30
+          compression-level: 6
+
+      - name: Write download instructions
+        if: success()
+        run: |
+          echo "### Experiment completed" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Framework: \`${{ inputs.framework }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Problem: \`${{ inputs.problem }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "- Artifact: \`${{ steps.experiment.outputs.artifact_name }}\`" >> "${GITHUB_STEP_SUMMARY}"
+          echo "" >> "${GITHUB_STEP_SUMMARY}"
+          echo "Download it from the **Artifacts** section at the bottom of this workflow run." >> "${GITHUB_STEP_SUMMARY}"
